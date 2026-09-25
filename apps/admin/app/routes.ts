@@ -22,6 +22,9 @@ export default [
     route("authentication/oidc", "./(all)/(dashboard)/authentication/oidc/page.tsx"),
     route("ai", "./(all)/(dashboard)/ai/page.tsx"),
     route("image", "./(all)/(dashboard)/image/page.tsx"),
+    route("users", "./(all)/(dashboard)/users/page.tsx"),
+    route("users/create", "./(all)/(dashboard)/users/create/page.tsx"),
+    route("users/:userId", "./(all)/(dashboard)/users/detail/page.tsx"),
   ]),
   // Catch-all route for 404 handling - must be last
   route("*", "./components/404.tsx"),

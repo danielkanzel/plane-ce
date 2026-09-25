@@ -160,3 +160,32 @@ class TestOIDCOAuthProvider:
                 with pytest.raises(AuthenticationException) as exc:
                     provider.set_user_data()
         assert exc.value.error_message == "OAUTH_PROVIDER_UNVERIFIED_EMAIL"
+
+    def test_linked_subject_replaces_token_email(self):
+        linked_user = MagicMock()
+        linked_user.email = "owner@example.com"
+        account = MagicMock()
+        account.user = linked_user
+
+        with _config("1", "plane", "secret", ISSUER):
+            with patch("plane.authentication.provider.oauth.oidc.cache") as mock_cache:
+                mock_cache.get.return_value = DISCOVERY
+                provider = OIDCOAuthProvider(request=_request(), code="code", code_verifier="verifier")
+
+        provider.user_data = {
+            "email": "other@authentik.local",
+            "user": {"provider_id": "akadmin", "email": "other@authentik.local"},
+        }
+        with patch("plane.authentication.provider.oauth.oidc.Account.objects") as accounts:
+            accounts.filter.return_value.select_related.return_value.first.return_value = account
+            with patch(
+                "plane.authentication.adapter.oauth.OauthAdapter.complete_login_or_signup",
+                return_value=linked_user,
+            ) as complete:
+                result = provider.complete_login_or_signup()
+
+        assert result is linked_user
+        assert provider.user_data["email"] == "owner@example.com"
+        assert provider.user_data["user"]["email"] == "owner@example.com"
+        accounts.filter.assert_called_once_with(provider="oidc", provider_account_id="akadmin")
+        complete.assert_called_once()

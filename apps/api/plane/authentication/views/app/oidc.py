@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # See the LICENSE file for details.
 
+import logging
 import uuid
 from urllib.parse import urlencode, urljoin
 
@@ -21,6 +22,21 @@ from plane.authentication.utils.redirection_path import get_redirection_path
 from plane.authentication.utils.user_auth_workflow import post_user_auth_workflow
 from plane.license.models import Instance
 from plane.utils.path_validator import validate_next_path
+
+logger = logging.getLogger("plane.authentication")
+
+
+def _redirect_host(request, session_host):
+    if isinstance(session_host, str) and session_host:
+        return session_host
+    return base_host(request=request, is_app=True) or "/"
+
+
+def _error_redirect(host, next_path, exc):
+    params = exc.get_error_dict()
+    if next_path:
+        params["next_path"] = str(validate_next_path(next_path))
+    return HttpResponseRedirect(urljoin(host, "?" + urlencode(params)))
 
 
 class OIDCOauthInitiateEndpoint(View):
@@ -59,7 +75,7 @@ class OIDCCallbackEndpoint(View):
     def get(self, request):
         code = request.GET.get("code")
         state = request.GET.get("state")
-        base_host_url = request.session.get("host")
+        host = _redirect_host(request, request.session.get("host"))
         next_path = request.session.get("next_path")
 
         if state != request.session.get("state", "") or not code:
@@ -67,11 +83,7 @@ class OIDCCallbackEndpoint(View):
                 error_code=AUTHENTICATION_ERROR_CODES["OIDC_OAUTH_PROVIDER_ERROR"],
                 error_message="OIDC_OAUTH_PROVIDER_ERROR",
             )
-            params = exc.get_error_dict()
-            if next_path:
-                params["next_path"] = str(validate_next_path(next_path))
-            url = urljoin(base_host_url, "?" + urlencode(params))
-            return HttpResponseRedirect(url)
+            return _error_redirect(host, next_path, exc)
 
         try:
             provider = OIDCOAuthProvider(
@@ -83,10 +95,13 @@ class OIDCCallbackEndpoint(View):
             user = provider.authenticate()
             user_login(request=request, user=user, is_app=True)
             path = str(validate_next_path(next_path)) if next_path else get_redirection_path(user=user)
-            return HttpResponseRedirect(urljoin(base_host_url, path))
+            return HttpResponseRedirect(urljoin(host, path))
         except AuthenticationException as e:
-            params = e.get_error_dict()
-            if next_path:
-                params["next_path"] = str(validate_next_path(next_path))
-            url = urljoin(base_host_url, "?" + urlencode(params))
-            return HttpResponseRedirect(url)
+            return _error_redirect(host, next_path, e)
+        except Exception as exc:
+            logger.error("OIDC callback failed: %s", type(exc).__name__)
+            fallback = AuthenticationException(
+                error_code=AUTHENTICATION_ERROR_CODES["OIDC_OAUTH_PROVIDER_ERROR"],
+                error_message="OIDC_OAUTH_PROVIDER_ERROR",
+            )
+            return _error_redirect(host, next_path, fallback)

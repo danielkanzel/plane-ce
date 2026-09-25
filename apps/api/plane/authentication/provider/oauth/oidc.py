@@ -14,7 +14,7 @@ import pytz
 import requests
 from django.core.cache import cache
 from jwt import PyJWKClient, decode as jwt_decode
-from jwt.exceptions import InvalidTokenError, PyJWKClientError
+from jwt.exceptions import PyJWTError
 
 # Module imports
 from plane.authentication.adapter.error import (
@@ -22,6 +22,7 @@ from plane.authentication.adapter.error import (
     AuthenticationException,
 )
 from plane.authentication.adapter.oauth import OauthAdapter
+from plane.db.models import Account
 from plane.license.utils.instance_value import get_configuration_value
 
 _ALLOWED_ALGS = {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256", "PS384", "PS512"}
@@ -74,6 +75,26 @@ def _absolute_endpoint(url, issuer_scheme):
 def _email_is_verified(claims):
     value = claims.get("email_verified")
     return value is True or (isinstance(value, str) and value.lower() == "true")
+
+
+def _access_token_expired_at(token_response):
+    raw = token_response.get("expires_in")
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0 or seconds > 60 * 60 * 24 * 365:
+        return None
+    return datetime.now(tz=pytz.utc) + timedelta(seconds=seconds)
+
+
+def _https_picture(claims):
+    picture = claims.get("picture")
+    if isinstance(picture, str) and picture.startswith("https://") and len(picture) <= 2048:
+        return picture
+    return ""
 
 
 def _split_name(claims):
@@ -201,7 +222,7 @@ class OIDCOAuthProvider(OauthAdapter):
                 issuer=self.expected_issuer,
                 options={"require": ["exp", "sub"]},
             )
-        except (InvalidTokenError, PyJWKClientError, ValueError):
+        except (PyJWTError, ValueError, TypeError):
             self.logger.warning("OIDC id_token failed validation")
             raise AuthenticationException(
                 error_code=AUTHENTICATION_ERROR_CODES["OIDC_OAUTH_PROVIDER_ERROR"],
@@ -234,16 +255,8 @@ class OIDCOAuthProvider(OauthAdapter):
             {
                 "access_token": token_response.get("access_token"),
                 "refresh_token": token_response.get("refresh_token", None),
-                "access_token_expired_at": (
-                    datetime.now(tz=pytz.utc) + timedelta(seconds=token_response.get("expires_in"))
-                    if token_response.get("expires_in")
-                    else None
-                ),
-                "refresh_token_expired_at": (
-                    datetime.fromtimestamp(token_response.get("refresh_token_expired_at"), tz=pytz.utc)
-                    if token_response.get("refresh_token_expired_at")
-                    else None
-                ),
+                "access_token_expired_at": _access_token_expired_at(token_response),
+                "refresh_token_expired_at": None,
                 "id_token": id_token,
             }
         )
@@ -254,6 +267,11 @@ class OIDCOAuthProvider(OauthAdapter):
             profile = self.get_user_response() or {}
         except AuthenticationException:
             self.logger.warning("OIDC userinfo request failed; using verified id_token claims")
+        except (ValueError, TypeError):
+            self.logger.warning("OIDC userinfo response could not be read")
+            profile = {}
+        if not isinstance(profile, dict):
+            profile = {}
 
         if profile.get("sub") and profile.get("sub") != self.id_token_claims.get("sub"):
             raise AuthenticationException(
@@ -278,10 +296,28 @@ class OIDCOAuthProvider(OauthAdapter):
                 "user": {
                     "provider_id": str(claims.get("sub") or ""),
                     "email": email,
-                    "avatar": claims.get("picture") or "",
+                    "avatar": _https_picture(claims),
                     "first_name": first_name,
                     "last_name": last_name,
                     "is_password_autoset": True,
                 },
             }
         )
+
+    def complete_login_or_signup(self):
+        # An admin-linked subject wins over the email in the token. Authentik's
+        # email often differs from the Plane account the subject was bound to.
+        provider_id = str((self.user_data.get("user") or {}).get("provider_id") or "")
+        if provider_id:
+            account = (
+                Account.objects.filter(provider=self.provider, provider_account_id=provider_id)
+                .select_related("user")
+                .first()
+            )
+            linked_email = getattr(getattr(account, "user", None), "email", None)
+            if linked_email:
+                self.user_data["email"] = linked_email
+                user_payload = self.user_data.get("user")
+                if isinstance(user_payload, dict):
+                    user_payload["email"] = linked_email
+        return super().complete_login_or_signup()
