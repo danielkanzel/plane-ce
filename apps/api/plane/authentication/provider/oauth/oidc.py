@@ -97,6 +97,131 @@ def _https_picture(claims):
     return ""
 
 
+def load_oidc_discovery(issuer):
+    cache_key = "oidc-discovery-" + hashlib.sha256(issuer.encode()).hexdigest()
+    cached = cache.get(cache_key)
+    if isinstance(cached, dict):
+        return cached
+    try:
+        response = requests.get(
+            f"{issuer}/.well-known/openid-configuration",
+            timeout=10,
+            allow_redirects=False,
+        )
+        response.raise_for_status()
+        document = response.json()
+    except (requests.RequestException, ValueError):
+        logging.getLogger("plane.authentication").warning("OIDC discovery document could not be loaded")
+        raise AuthenticationException(
+            error_code=AUTHENTICATION_ERROR_CODES["OIDC_OAUTH_PROVIDER_ERROR"],
+            error_message="OIDC_OAUTH_PROVIDER_ERROR",
+        )
+    for key in ("issuer", "authorization_endpoint", "token_endpoint", "userinfo_endpoint", "jwks_uri"):
+        if not document.get(key):
+            raise AuthenticationException(
+                error_code=AUTHENTICATION_ERROR_CODES["OIDC_OAUTH_PROVIDER_ERROR"],
+                error_message="OIDC_OAUTH_PROVIDER_ERROR",
+            )
+    cache.set(cache_key, document, 300)
+    return document
+
+
+def _api_audiences(raw):
+    if not isinstance(raw, str):
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def verify_oidc_access_token(token, issuer, audiences):
+    """Check an access token from an OIDC issuer. Used by the external API.
+
+    ToolHive already checked the token, and the shim forwards that same token
+    as the Plane API key. Plane checks it again: the shim is on the host
+    loopback, and this is what makes the caller a Plane user.
+    """
+    issuer = _normalize_issuer(issuer)
+    if not audiences:
+        raise AuthenticationException(
+            error_code=AUTHENTICATION_ERROR_CODES["OIDC_NOT_CONFIGURED"],
+            error_message="OIDC_NOT_CONFIGURED",
+        )
+    discovery = load_oidc_discovery(issuer)
+    if discovery.get("issuer", "").rstrip("/") != issuer:
+        raise AuthenticationException(
+            error_code=AUTHENTICATION_ERROR_CODES["OIDC_OAUTH_PROVIDER_ERROR"],
+            error_message="OIDC_OAUTH_PROVIDER_ERROR",
+        )
+    issuer_scheme = urlparse(issuer).scheme
+    jwks_uri = _absolute_endpoint(discovery.get("jwks_uri"), issuer_scheme)
+    supported = discovery.get("id_token_signing_alg_values_supported") or ["RS256"]
+    algorithms = [alg for alg in supported if alg in _ALLOWED_ALGS] or ["RS256"]
+    try:
+        client = _JWKS_CLIENTS.get(jwks_uri)
+        if client is None:
+            client = PyJWKClient(jwks_uri, cache_keys=True, lifespan=300, timeout=10)
+            _JWKS_CLIENTS[jwks_uri] = client
+        signing_key = client.get_signing_key_from_jwt(token)
+        return jwt_decode(
+            token,
+            signing_key.key,
+            algorithms=algorithms,
+            audience=audiences,
+            issuer=discovery.get("issuer"),
+            options={"require": ["exp", "sub"]},
+        )
+    except (PyJWTError, ValueError, TypeError):
+        logging.getLogger("plane.authentication").warning("OIDC access token failed validation")
+        raise AuthenticationException(
+            error_code=AUTHENTICATION_ERROR_CODES["OIDC_OAUTH_PROVIDER_ERROR"],
+            error_message="OIDC_OAUTH_PROVIDER_ERROR",
+        )
+
+
+def authenticate_oidc_api_token(token):
+    """Return the Plane user linked to this OIDC access token.
+
+    The link is Account.provider_account_id, the same subject an admin binds
+    or a browser OIDC login stores. A token with no linked user does not
+    create an account.
+    """
+    enabled, issuer, audience = get_configuration_value(
+        [
+            {"key": "IS_OIDC_ENABLED", "default": os.environ.get("IS_OIDC_ENABLED", "0")},
+            {"key": "OIDC_API_ISSUER_URL", "default": os.environ.get("OIDC_API_ISSUER_URL")},
+            {"key": "OIDC_API_AUDIENCE", "default": os.environ.get("OIDC_API_AUDIENCE")},
+        ]
+    )
+    if enabled != "1" or not issuer or not _api_audiences(audience):
+        raise AuthenticationException(
+            error_code=AUTHENTICATION_ERROR_CODES["OIDC_NOT_CONFIGURED"],
+            error_message="OIDC_NOT_CONFIGURED",
+        )
+    claims = verify_oidc_access_token(token, issuer, _api_audiences(audience))
+    subject = claims.get("sub")
+    if not isinstance(subject, str) or not subject.strip():
+        raise AuthenticationException(
+            error_code=AUTHENTICATION_ERROR_CODES["OIDC_OAUTH_PROVIDER_ERROR"],
+            error_message="OIDC_OAUTH_PROVIDER_ERROR",
+        )
+    account = (
+        Account.objects.filter(provider="oidc", provider_account_id=subject.strip())
+        .select_related("user")
+        .first()
+    )
+    user = getattr(account, "user", None)
+    if user is None:
+        raise AuthenticationException(
+            error_code=AUTHENTICATION_ERROR_CODES["USER_DOES_NOT_EXIST"],
+            error_message="USER_DOES_NOT_EXIST",
+        )
+    if not user.is_active:
+        raise AuthenticationException(
+            error_code=AUTHENTICATION_ERROR_CODES["USER_ACCOUNT_DEACTIVATED"],
+            error_message="USER_ACCOUNT_DEACTIVATED",
+        )
+    return user
+
+
 def _split_name(claims):
     given = str(claims.get("given_name") or "").strip()
     family = str(claims.get("family_name") or "").strip()
@@ -180,32 +305,7 @@ class OIDCOAuthProvider(OauthAdapter):
         )
 
     def _load_discovery(self, issuer):
-        cache_key = "oidc-discovery-" + hashlib.sha256(issuer.encode()).hexdigest()
-        cached = cache.get(cache_key)
-        if isinstance(cached, dict):
-            return cached
-        try:
-            response = requests.get(
-                f"{issuer}/.well-known/openid-configuration",
-                timeout=10,
-                allow_redirects=False,
-            )
-            response.raise_for_status()
-            document = response.json()
-        except (requests.RequestException, ValueError):
-            logging.getLogger("plane.authentication").warning("OIDC discovery document could not be loaded")
-            raise AuthenticationException(
-                error_code=AUTHENTICATION_ERROR_CODES["OIDC_OAUTH_PROVIDER_ERROR"],
-                error_message="OIDC_OAUTH_PROVIDER_ERROR",
-            )
-        for key in ("issuer", "authorization_endpoint", "token_endpoint", "userinfo_endpoint", "jwks_uri"):
-            if not document.get(key):
-                raise AuthenticationException(
-                    error_code=AUTHENTICATION_ERROR_CODES["OIDC_OAUTH_PROVIDER_ERROR"],
-                    error_message="OIDC_OAUTH_PROVIDER_ERROR",
-                )
-        cache.set(cache_key, document, 300)
-        return document
+        return load_oidc_discovery(issuer)
 
     def _validate_id_token(self, id_token):
         try:

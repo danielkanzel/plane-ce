@@ -11,7 +11,16 @@ from rest_framework import authentication
 from rest_framework.exceptions import AuthenticationFailed
 
 # Module imports
+from plane.authentication.adapter.error import AuthenticationException
+from plane.authentication.provider.oauth.oidc import authenticate_oidc_api_token
 from plane.db.models import APIToken
+
+_OIDC_API_DETAIL = {
+    "OIDC_NOT_CONFIGURED": "OIDC API authentication is not configured",
+    "OIDC_OAUTH_PROVIDER_ERROR": "OIDC access token is not valid",
+    "USER_DOES_NOT_EXIST": "No Plane user is linked to this login",
+    "USER_ACCOUNT_DEACTIVATED": "Plane user is deactivated",
+}
 
 
 class APIKeyAuthentication(authentication.BaseAuthentication):
@@ -27,6 +36,16 @@ class APIKeyAuthentication(authentication.BaseAuthentication):
         return request.headers.get(self.auth_header_name)
 
     def validate_api_token(self, token):
+        # ToolHive's access token is a JWT. The shim forwards it unchanged,
+        # and the Plane MCP server sends it here as X-Api-Key. An opaque
+        # plane_api_* key stays on the path below.
+        if isinstance(token, str) and token.count(".") == 2 and token.startswith("eyJ"):
+            try:
+                user = authenticate_oidc_api_token(token)
+            except AuthenticationException as exc:
+                raise AuthenticationFailed(_OIDC_API_DETAIL.get(exc.error_message, "OIDC access token is not valid"))
+            return (user, token)
+
         try:
             api_token = APIToken.objects.get(
                 Q(Q(expired_at__gt=timezone.now()) | Q(expired_at__isnull=True)),

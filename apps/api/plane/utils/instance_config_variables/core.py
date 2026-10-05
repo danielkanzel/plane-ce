@@ -199,6 +199,18 @@ oidc_config_variables = [
         "category": "OIDC",
         "is_encrypted": False,
     },
+    {
+        "key": "OIDC_API_ISSUER_URL",
+        "value": os.environ.get("OIDC_API_ISSUER_URL"),
+        "category": "OIDC",
+        "is_encrypted": False,
+    },
+    {
+        "key": "OIDC_API_AUDIENCE",
+        "value": os.environ.get("OIDC_API_AUDIENCE"),
+        "category": "OIDC",
+        "is_encrypted": False,
+    },
 ]
 
 smtp_config_variables = [
